@@ -1,11 +1,25 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
-    col, to_timestamp, when, lag, max as spark_max,
-    lit, unix_timestamp, row_number, avg,
-    sum as spark_sum, coalesce
+    col, to_timestamp, lag, max as spark_max,
+    lit, unix_timestamp, row_number, avg, coalesce
 )
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import StructType, StructField, StringType
 import sys
+
+
+# Explicit schemas are required for structured streaming (readStream cannot infer schema)
+MONITORING_SCHEMA = StructType([
+    StructField("time", StringType(), True),
+    StructField("service_id", StringType(), True),
+    StructField("status", StringType(), True),
+])
+
+PROVISIONING_SCHEMA = StructType([
+    StructField("time", StringType(), True),
+    StructField("service_id", StringType(), True),
+    StructField("customer_id", StringType(), True),
+    StructField("segment", StringType(), True),
+])
 
 
 class TelecomStreamProcessor:
@@ -17,21 +31,51 @@ class TelecomStreamProcessor:
             .getOrCreate()
         self.spark.sparkContext.setLogLevel("WARN")
 
-    def load_monitoring_stream(self, file_path):
-        """Load monitoring data stream"""
-        df = self.spark.read \
-            .option("header", "true") \
-            .csv(file_path)
-        df = df.withColumn("time", to_timestamp(col("time")))
-        return df.select("time", "service_id", "status")
+    def ingest_streams(self, monitoring_dir, provisioning_dir):
+        """
+        Consume monitoring and provisioning CSV files from directories using
+        Spark Structured Streaming (readStream).
 
-    def load_provisioning_stream(self, file_path):
-        """Load provisioning data stream"""
-        df = self.spark.read \
+        Both streams are written to in-memory query tables via the 'memory' sink.
+        trigger(once=True) processes all files currently in the directories and stops,
+        making this suitable for batch-style CSV input while using the streaming API.
+        """
+        monitoring_stream = self.spark.readStream \
+            .schema(MONITORING_SCHEMA) \
             .option("header", "true") \
-            .csv(file_path)
-        df = df.withColumn("time", to_timestamp(col("time")))
-        return df.select("time", "service_id", "customer_id", "segment")
+            .csv(monitoring_dir)
+
+        provisioning_stream = self.spark.readStream \
+            .schema(PROVISIONING_SCHEMA) \
+            .option("header", "true") \
+            .csv(provisioning_dir)
+
+        monitoring_query = monitoring_stream \
+            .writeStream \
+            .format("memory") \
+            .queryName("monitoring") \
+            .trigger(once=True) \
+            .start()
+
+        provisioning_query = provisioning_stream \
+            .writeStream \
+            .format("memory") \
+            .queryName("provisioning") \
+            .trigger(once=True) \
+            .start()
+
+        monitoring_query.awaitTermination()
+        provisioning_query.awaitTermination()
+
+        monitoring_df = self.spark.sql("SELECT * FROM monitoring") \
+            .withColumn("time", to_timestamp(col("time"))) \
+            .select("time", "service_id", "status")
+
+        provisioning_df = self.spark.sql("SELECT * FROM provisioning") \
+            .withColumn("time", to_timestamp(col("time"))) \
+            .select("time", "service_id", "customer_id", "segment")
+
+        return monitoring_df, provisioning_df
 
     def get_active_provisioning_at(self, provisioning_df, query_time):
         """
@@ -98,8 +142,12 @@ class TelecomStreamProcessor:
         A downtime period ends when status transitions to UP.
         If still DOWN at query_time, the period is open-ended (end = query_time).
         """
-        # Filter events up to query_time
-        filtered = monitoring_df.filter(col("time") <= lit(query_time))
+        # Filter events up to query_time.
+        # Call toDF() to generate fresh column IDs — this prevents "conflicting references"
+        # when joining two DataFrames that are both derived from the same source plan.
+        filtered = monitoring_df \
+            .filter(col("time") <= lit(query_time)) \
+            .toDF("time", "service_id", "status")
 
         window_spec = Window.partitionBy("service_id").orderBy("time")
 
@@ -200,20 +248,20 @@ class TelecomStreamProcessor:
 
         return business_downtimes, stats
 
-    def run(self, monitoring_path, provisioning_path, query_time_str):
+    def run(self, monitoring_dir, provisioning_dir, query_time_str):
         """Main execution"""
 
         print("\n" + "=" * 60)
         print("TELECOM STREAM ANALYTICS")
         print("=" * 60)
 
-        # Load data
-        print("\nLoading monitoring stream...")
-        monitoring_df = self.load_monitoring_stream(monitoring_path)
+        # Consume data via Structured Streaming
+        print(f"\nConsuming monitoring stream from: {monitoring_dir}")
+        print(f"Consuming provisioning stream from: {provisioning_dir}")
+        monitoring_df, provisioning_df = self.ingest_streams(monitoring_dir, provisioning_dir)
+        monitoring_df.cache()
+        provisioning_df.cache()
         print(f"Loaded {monitoring_df.count()} monitoring events")
-
-        print("Loading provisioning stream...")
-        provisioning_df = self.load_provisioning_stream(provisioning_path)
         print(f"Loaded {provisioning_df.count()} provisioning events")
 
         query_time = query_time_str
@@ -262,17 +310,18 @@ class TelecomStreamProcessor:
 
 def main():
     if len(sys.argv) < 4:
-        print("\nUsage: spark-submit stream_processor.py <monitoring_csv> <provisioning_csv> <query_time>")
+        print("\nUsage: spark-submit stream_processor.py <monitoring_dir> <provisioning_dir> <query_time>")
         print("\nExample:")
-        print("  spark-submit stream_processor.py monitoring_stream.csv provisioning_stream.csv '2021-04-14T08:09:52Z'")
+        print("  spark-submit stream_processor.py monitoring_data/ provisioning_data/ '2021-04-14T08:09:52Z'")
+        print("\nNote: Run setup_dirs.sh first to create the input directories from the CSV files.")
         sys.exit(1)
 
-    monitoring_path = sys.argv[1]
-    provisioning_path = sys.argv[2]
+    monitoring_dir = sys.argv[1]
+    provisioning_dir = sys.argv[2]
     query_time = sys.argv[3]
 
     processor = TelecomStreamProcessor()
-    processor.run(monitoring_path, provisioning_path, query_time)
+    processor.run(monitoring_dir, provisioning_dir, query_time)
 
 
 if __name__ == "__main__":
