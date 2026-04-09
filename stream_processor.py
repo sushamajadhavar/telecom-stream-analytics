@@ -1,236 +1,279 @@
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
     col, to_timestamp, when, lag, max as spark_max,
-    collect_list, struct, lit, unix_timestamp,
-    coalesce, last, row_number, avg
+    lit, unix_timestamp, row_number, avg,
+    sum as spark_sum, coalesce
 )
-from pyspark.sql.types import StructType, StructField, StringType, TimestampType
-from datetime import datetime
+from pyspark.sql.types import DoubleType
 import sys
+
 
 class TelecomStreamProcessor:
     def __init__(self):
         self.spark = SparkSession.builder \
             .appName("TelecomStreamAnalytics") \
             .config("spark.sql.shuffle.partitions", "1") \
+            .master("local[*]") \
             .getOrCreate()
         self.spark.sparkContext.setLogLevel("WARN")
-    
+
     def load_monitoring_stream(self, file_path):
         """Load monitoring data stream"""
         df = self.spark.read \
             .option("header", "true") \
             .csv(file_path)
-        
         df = df.withColumn("time", to_timestamp(col("time")))
         return df.select("time", "service_id", "status")
-    
+
     def load_provisioning_stream(self, file_path):
         """Load provisioning data stream"""
         df = self.spark.read \
             .option("header", "true") \
             .csv(file_path)
-        
         df = df.withColumn("time", to_timestamp(col("time")))
-        
-        # Mark unprovisioning events (empty customer_id and segment)
-        df = df.withColumn(
-            "is_unprovisioning",
-            when((col("customer_id").isNull()) | (col("customer_id") == ""), True).otherwise(False)
-        )
-        
-        return df.select("time", "service_id", "customer_id", "segment", "is_unprovisioning")
-    
+        return df.select("time", "service_id", "customer_id", "segment")
+
+    def get_active_provisioning_at(self, provisioning_df, query_time):
+        """
+        For each service, get the most recent provisioning event at or before query_time.
+        If that event is an unprovisioning (empty customer_id), the service has no customer.
+        """
+        window_spec = Window.partitionBy("service_id").orderBy(col("time").desc())
+
+        latest_prov = provisioning_df \
+            .filter(col("time") <= lit(query_time)) \
+            .withColumn("rn", row_number().over(window_spec)) \
+            .filter(col("rn") == 1) \
+            .drop("rn")
+
+        # Only keep services that are actively provisioned (non-empty customer_id)
+        active_prov = latest_prov \
+            .filter(col("customer_id").isNotNull() & (col("customer_id") != "")) \
+            .select("service_id", "customer_id", "segment")
+
+        return active_prov
+
+    def get_latest_service_status(self, monitoring_df, query_time):
+        """
+        For each service, get the most recent status at or before query_time.
+        """
+        window_spec = Window.partitionBy("service_id").orderBy(col("time").desc())
+
+        latest_status = monitoring_df \
+            .filter(col("time") <= lit(query_time)) \
+            .withColumn("rn", row_number().over(window_spec)) \
+            .filter(col("rn") == 1) \
+            .select("service_id", "status") \
+            .drop("rn")
+
+        return latest_status
+
     def get_customers_in_downtime(self, monitoring_df, provisioning_df, query_time):
         """
-        Task A: Get list of customers experiencing downtime at given time
+        Task A: Get list of customers experiencing downtime at a given time.
+
+        A customer is in downtime if:
+        1. Their service's latest monitoring status (at or before query_time) is DOWN
+        2. The service is actively provisioned to a customer at query_time
         """
-        
-        # Get latest provisioning state for each service before query_time
-        window_spec = Window.partitionBy("service_id").orderBy(col("time").desc())
-        
-        # Get last known customer for each service (handling unprovisioning)
-        last_customer = provisioning_df \
-            .filter(col("time") <= query_time) \
-            .withColumn(
-                "last_customer",
-                last(
-                    when(~col("is_unprovisioning"), struct(col("customer_id"), col("segment")))
-                ).over(window_spec)
-            ) \
-            .select("service_id", col("last_customer.customer_id").alias("customer_id"), 
-                   col("last_customer.segment").alias("segment")) \
-            .distinct()
-        
-        # Get services that are DOWN at query_time
-        services_down = monitoring_df \
-            .filter(col("time") <= query_time) \
-            .withColumn("rank", row_number().over(Window.partitionBy("service_id").orderBy(col("time").desc()))) \
-            .filter(col("rank") == 1) \
-            .filter(col("status") == "DOWN") \
-            .select("service_id")
-        
-        # Join to get customers in downtime
+        # Get services currently DOWN
+        latest_status = self.get_latest_service_status(monitoring_df, query_time)
+        services_down = latest_status.filter(col("status") == "DOWN").select("service_id")
+
+        # Get active customer assignments
+        active_prov = self.get_active_provisioning_at(provisioning_df, query_time)
+
+        # Join: customers whose service is DOWN
         customers_in_downtime = services_down \
-            .join(last_customer, "service_id", "inner") \
-            .select("service_id", "customer_id", "segment") \
-            .filter(col("customer_id").isNotNull())
-        
+            .join(active_prov, "service_id", "inner") \
+            .select("customer_id", "service_id", "segment")
+
         return customers_in_downtime
-    
-    def get_downtime_periods(self, monitoring_df):
+
+    def get_downtime_periods(self, monitoring_df, query_time):
         """
-        Identify downtime periods (from DOWN to UP transition)
+        Identify downtime periods for each service up to query_time.
+
+        A downtime period starts when status transitions to DOWN (or the first event is DOWN).
+        A downtime period ends when status transitions to UP.
+        If still DOWN at query_time, the period is open-ended (end = query_time).
         """
-        
-        # Add row number to track state changes
+        # Filter events up to query_time
+        filtered = monitoring_df.filter(col("time") <= lit(query_time))
+
         window_spec = Window.partitionBy("service_id").orderBy("time")
-        
-        df_with_lag = monitoring_df \
-            .withColumn("prev_status", lag("status").over(window_spec)) \
-            .withColumn("status_changed", 
-                       when(col("prev_status") != col("status"), True).otherwise(False))
-        
-        # Identify downtime start (UP to DOWN transition)
-        downtime_starts = df_with_lag \
-            .filter((col("prev_status") == "UP") & (col("status") == "DOWN")) \
-            .select(
-                col("service_id"),
-                col("time").alias("downtime_start"),
-                row_number().over(Window.partitionBy("service_id").orderBy("time")).alias("downtime_id")
-            )
-        
-        # Identify downtime end (DOWN to UP transition)
-        downtime_ends = df_with_lag \
-            .filter((col("prev_status") == "DOWN") & (col("status") == "UP")) \
-            .select(
-                col("service_id"),
-                col("time").alias("downtime_end"),
-                row_number().over(Window.partitionBy("service_id").orderBy("time")).alias("downtime_id")
-            )
-        
-        # Join starts and ends
-        downtime_periods = downtime_starts \
-            .join(downtime_ends, ["service_id", "downtime_id"], "inner") \
+
+        df = filtered \
+            .withColumn("prev_status", lag("status").over(window_spec))
+
+        # Downtime starts: first event is DOWN (prev_status is null) OR transition from UP to DOWN
+        downtime_starts = df \
+            .filter(
+                (col("status") == "DOWN") &
+                ((col("prev_status").isNull()) | (col("prev_status") == "UP"))
+            ) \
+            .select(col("service_id"), col("time").alias("downtime_start"))
+
+        # Downtime ends: transition from DOWN to UP
+        downtime_ends = df \
+            .filter(
+                (col("status") == "UP") &
+                (col("prev_status") == "DOWN")
+            ) \
+            .select(col("service_id"), col("time").alias("downtime_end"))
+
+        # Add row numbers to pair starts with ends properly
+        start_window = Window.partitionBy("service_id").orderBy("downtime_start")
+        end_window = Window.partitionBy("service_id").orderBy("downtime_end")
+
+        starts_numbered = downtime_starts.withColumn(
+            "period_id", row_number().over(start_window)
+        )
+        ends_numbered = downtime_ends.withColumn(
+            "period_id", row_number().over(end_window)
+        )
+
+        # Left join so that open-ended downtimes (no matching end) are preserved
+        downtime_periods = starts_numbered \
+            .join(ends_numbered, ["service_id", "period_id"], "left") \
+            .withColumn(
+                "downtime_end",
+                coalesce(col("downtime_end"), lit(query_time).cast("timestamp"))
+            ) \
             .withColumn(
                 "duration_seconds",
-                (unix_timestamp("downtime_end") - unix_timestamp("downtime_start"))
-            )
-        
+                unix_timestamp("downtime_end") - unix_timestamp("downtime_start")
+            ) \
+            .select("service_id", "downtime_start", "downtime_end", "duration_seconds")
+
         return downtime_periods
-    
+
     def get_business_downtime_stats(self, monitoring_df, provisioning_df, query_time):
         """
-        Task B: Calculate mean duration of disturbance for business customers
+        Task B: Calculate mean duration of disturbance for business customers up to query_time.
+
+        Important: The segment is determined by the provisioning state at the time of each
+        downtime period, not the latest segment.
         """
-        
-        # Get downtime periods
-        downtime_periods = self.get_downtime_periods(monitoring_df)
-        
-        # Get provisioning info for each service
-        window_spec_service = Window.partitionBy("service_id").orderBy(col("time").desc())
-        
-        service_segments = provisioning_df \
-            .filter(col("time") <= query_time) \
-            .withColumn(
-                "last_assignment",
-                last(
-                    when(~col("is_unprovisioning"), struct(col("customer_id"), col("segment")))
-                ).over(window_spec_service)
-            ) \
+        downtime_periods = self.get_downtime_periods(monitoring_df, query_time)
+
+        # For each downtime period, find the provisioning state at the downtime_start.
+        prov_filtered = provisioning_df.filter(col("time") <= lit(query_time))
+
+        # Join downtimes with provisioning where prov.time <= downtime_start
+        dt_alias = downtime_periods.alias("dt")
+        prov_alias = prov_filtered.alias("prov")
+
+        joined = dt_alias.join(
+            prov_alias,
+            (col("dt.service_id") == col("prov.service_id")) &
+            (col("prov.time") <= col("dt.downtime_start")),
+            "inner"
+        )
+
+        window_spec = Window.partitionBy(
+            col("dt.service_id"), col("dt.downtime_start")
+        ).orderBy(col("prov.time").desc())
+
+        prov_at_downtime = joined \
+            .withColumn("rn", row_number().over(window_spec)) \
+            .filter(col("rn") == 1) \
             .select(
-                col("service_id"),
-                col("last_assignment.segment").alias("segment")
-            ) \
-            .distinct()
-        
-        # Filter for business customers only
-        business_downtimes = downtime_periods \
-            .join(service_segments, "service_id", "inner") \
-            .filter(col("segment") == "BUSINESS") \
-            .filter(col("downtime_end") <= query_time)
-        
-        # Calculate mean duration
-        stats = business_downtimes \
-            .agg(
-                avg("duration_seconds").alias("mean_duration_seconds"),
-                spark_max("duration_seconds").alias("max_duration_seconds")
+                col("dt.service_id").alias("service_id"),
+                col("dt.downtime_start").alias("downtime_start"),
+                col("dt.downtime_end").alias("downtime_end"),
+                col("dt.duration_seconds").alias("duration_seconds"),
+                col("prov.customer_id").alias("customer_id"),
+                col("prov.segment").alias("segment")
             )
-        
+
+        # Filter for BUSINESS customers with active provisioning
+        business_downtimes = prov_at_downtime \
+            .filter(col("segment") == "BUSINESS") \
+            .filter(col("customer_id").isNotNull() & (col("customer_id") != ""))
+
+        # Calculate statistics
+        stats = business_downtimes.agg(
+            avg("duration_seconds").alias("mean_duration_seconds"),
+            spark_max("duration_seconds").alias("max_duration_seconds")
+        )
+
         return business_downtimes, stats
-    
+
     def run(self, monitoring_path, provisioning_path, query_time_str):
         """Main execution"""
-        
-        print("\n" + "="*60)
+
+        print("\n" + "=" * 60)
         print("TELECOM STREAM ANALYTICS")
-        print("="*60)
-        
+        print("=" * 60)
+
         # Load data
         print("\nLoading monitoring stream...")
         monitoring_df = self.load_monitoring_stream(monitoring_path)
         print(f"Loaded {monitoring_df.count()} monitoring events")
-        
+
         print("Loading provisioning stream...")
         provisioning_df = self.load_provisioning_stream(provisioning_path)
         print(f"Loaded {provisioning_df.count()} provisioning events")
-        
-        # Parse query time
-        query_time = to_timestamp(lit(query_time_str)).cast(TimestampType())
-        
-        print(f"\nQuery Time: {query_time_str}")
-        print("="*60)
-        
+
+        query_time = query_time_str
+        print(f"\nQuery Time: {query_time}")
+        print("=" * 60)
+
         # Task A: Customers in downtime
         print("\n### TASK A: CUSTOMERS EXPERIENCING DOWNTIME ###")
-        customers_down = self.get_customers_in_downtime(monitoring_df, provisioning_df, query_time)
-        
+        customers_down = self.get_customers_in_downtime(
+            monitoring_df, provisioning_df, query_time
+        )
+
         customers_down_collected = customers_down.collect()
-        
         if not customers_down_collected:
             print("\nNo customers experiencing downtime at this time.")
         else:
             print(f"\nCustomers in downtime: {len(customers_down_collected)}")
             customers_down.show(truncate=False)
-        
+
         # Task B: Business downtime stats
         print("\n### TASK B: BUSINESS CUSTOMER DOWNTIME STATISTICS ###")
         business_downtimes, stats = self.get_business_downtime_stats(
             monitoring_df, provisioning_df, query_time
         )
-        
+
         stats_collected = stats.collect()
         if stats_collected:
             mean_duration = stats_collected[0]["mean_duration_seconds"]
             max_duration = stats_collected[0]["max_duration_seconds"]
-            
+
             if mean_duration is not None:
                 print(f"\nMean downtime duration for BUSINESS customers: {mean_duration:.2f} seconds")
                 print(f"Max downtime duration for BUSINESS customers: {max_duration:.2f} seconds")
                 print(f"\nDowntime periods (BUSINESS customers):")
                 business_downtimes.select(
-                    "service_id", "downtime_start", "downtime_end", "duration_seconds"
+                    "service_id", "customer_id", "downtime_start",
+                    "downtime_end", "duration_seconds"
                 ).show(truncate=False)
             else:
                 print("\nNo business customer downtime data available.")
         else:
             print("No downtime data available.")
-        
-        print("\n" + "="*60)
+
+        print("\n" + "=" * 60)
+
 
 def main():
     if len(sys.argv) < 4:
-        print("\nUsage: python stream_processor.py <monitoring_csv> <provisioning_csv> <query_time>")
+        print("\nUsage: spark-submit stream_processor.py <monitoring_csv> <provisioning_csv> <query_time>")
         print("\nExample:")
-        print("  python stream_processor.py monitoring_stream.csv provisioning_stream.csv '2021-04-14T08:09:52Z'")
+        print("  spark-submit stream_processor.py monitoring_stream.csv provisioning_stream.csv '2021-04-14T08:09:52Z'")
         sys.exit(1)
-    
+
     monitoring_path = sys.argv[1]
     provisioning_path = sys.argv[2]
     query_time = sys.argv[3]
-    
+
     processor = TelecomStreamProcessor()
     processor.run(monitoring_path, provisioning_path, query_time)
+
 
 if __name__ == "__main__":
     main()
