@@ -5,6 +5,44 @@ This solution processes monitoring and provisioning data streams from a telecomm
 - **Task A**: Identify customers experiencing service downtimes at a given time
 - **Task B**: Calculate mean duration of service disturbances for business customers up to a given time
 
+## Approach
+
+### Streaming Architecture
+- Data is ingested using Spark Structured Streaming (`readStream`)
+- Streams are processed using micro-batch execution (`trigger(once=True)`)
+- This allows deterministic processing of bounded CSV data while maintaining a streaming architecture
+- Both streams are written to in-memory tables via the `memory` sink, then analysed using the standard DataFrame API
+
+### Task A: Customers Experiencing Downtime
+For a given query timestamp:
+1. Retrieve the latest service status (≤ query_time) for each service
+2. Retrieve the latest provisioning state (≤ query_time) for each service
+3. Join both to identify customers whose service is currently DOWN and actively provisioned
+
+Services that have been unprovisioned (empty `customer_id`) are excluded.
+
+### Task B: Mean Business Downtime Duration
+1. Identify downtime periods using status transitions:
+   - `UP → DOWN` = downtime start
+   - `DOWN → UP` = downtime end
+   - If still DOWN at query_time, the period is open-ended (end = query_time)
+2. Map each downtime period to the customer and segment that were active at the **start** of the downtime
+3. Filter for `BUSINESS` segment customers only
+4. Compute mean and max duration across all qualifying downtime periods
+
+## Assumptions
+- Input data is time-ordered within each stream
+- No late-arriving or out-of-order events
+- Each service is associated with at most one customer at any given time
+- Empty `customer_id` and `segment` fields indicate unprovisioning of a service
+- The segment classification for a downtime period is determined at the start of that period
+
+## Limitations
+- Uses micro-batch simulation (`trigger(once=True)`), not continuous streaming with stateful processing
+- No watermarking or late-event handling
+- Results are collected to the driver node (not scalable for very large datasets)
+- Window functions like `lag()` and `row_number()` operate on bounded data after ingestion
+
 ## Prerequisites
 - Python 3.7+
 - Java 8 or Java 11 (required by Spark)
@@ -32,7 +70,7 @@ provisioning_data/ <- contains provisioning_stream.csv
 
 You can also add new CSV files to these directories at any time; the streaming reader will pick them up automatically.
 
-## Usage
+## How to Run
 
 ```bash
 spark-submit stream_processor.py <monitoring_dir> <provisioning_dir> <query_time>
@@ -50,17 +88,13 @@ spark-submit stream_processor.py monitoring_data/ provisioning_data/ '2021-04-14
 python stream_processor.py monitoring_data/ provisioning_data/ '2021-04-14T08:09:52Z'
 ```
 
-## How It Works
+## Running Tests
 
-### Streaming Architecture
+```bash
+pytest test_stream_processor.py -v
+```
 
-The program uses Spark Structured Streaming (`spark.readStream`) to consume CSV files from input directories:
-
-1. **Stream ingestion** — Both monitoring and provisioning directories are read as streams using `readStream` with explicit `StructType` schemas (required for streaming).
-2. **`trigger(once=True)`** — Processes all currently available files in the directory as a single micro-batch and then stops the query (no ongoing monitoring). This makes it practical for CSV-based input while still using the streaming API.
-3. **Analysis** — Once ingestion completes, the in-memory data is analysed using the standard DataFrame API to answer Task A and Task B.
-
-### Data Format
+## Data Format
 
 **Monitoring stream** (`monitoring_data/` directory):
 | Column | Type | Description |
@@ -76,12 +110,4 @@ The program uses Spark Structured Streaming (`spark.readStream`) to consume CSV 
 | `service_id` | String | Unique service identifier |
 | `customer_id` | String | Customer ID (empty = unprovisioning event) |
 | `segment` | String | `BUSINESS` or `RESIDENTIAL` (empty for unprovisioning) |
-
-## Tasks
-
-### Task A: Customers Experiencing Downtime
-Identifies all customers whose service is currently `DOWN` at the given `query_time`, based on the latest monitoring event and active provisioning assignment at that time. Services that have been unprovisioned (latest provisioning event has an empty `customer_id`) are excluded.
-
-### Task B: Mean Business Downtime Duration
-Calculates the mean and maximum duration of all downtime periods for `BUSINESS`-segment customers up to `query_time`. The segment classification is determined at the **start** of each downtime period (not the latest segment), ensuring historical accuracy. Ongoing downtimes (service still `DOWN` at `query_time`) are included with an end time of `query_time`.
 
