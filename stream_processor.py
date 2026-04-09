@@ -142,7 +142,7 @@ class TelecomStreamProcessor:
         If still DOWN at query_time, the period is open-ended (end = query_time).
         """
         # Filter events up to query_time.
-        # Call toDF() to generate fresh column IDs — this prevents "conflicting references"
+        # Re-alias columns via toDF() to avoid Spark column lineage conflicts
         # when joining two DataFrames that are both derived from the same source plan.
         filtered = monitoring_df \
             .filter(col("time") <= lit(query_time)) \
