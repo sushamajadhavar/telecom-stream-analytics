@@ -8,3 +8,7 @@ dist/
 build/
 .env
 .venv/
+
+# Input directories created by setup_dirs.sh (not part of source)
+monitoring_data/
+provisioning_data/
