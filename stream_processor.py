@@ -107,8 +107,7 @@ class TelecomStreamProcessor:
             .filter(col("time") <= lit(query_time)) \
             .withColumn("rn", row_number().over(window_spec)) \
             .filter(col("rn") == 1) \
-            .select("service_id", "status") \
-            .drop("rn")
+            .select("service_id", "status")
 
         return latest_status
 
