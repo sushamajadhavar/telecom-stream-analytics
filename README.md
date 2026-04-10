@@ -11,7 +11,7 @@ This solution processes monitoring and provisioning data streams from a telecomm
 - Data is ingested using Spark Structured Streaming (`readStream`)
 - Streams are processed using micro-batch execution (`trigger(once=True)`)
 - This allows deterministic processing of bounded CSV data while maintaining a streaming architecture
-- Both streams are written to in-memory tables via the `memory` sink, then analysed using the standard DataFrame API
+- Both streams are written to temporary Parquet files on disk via the `parquet` sink, then read back and analysed using the standard DataFrame API; the temp directory is cleaned up automatically after each run
 
 ### Task A: Customers Experiencing Downtime
 For a given query timestamp:
@@ -42,6 +42,7 @@ Services that have been unprovisioned (empty `customer_id`) are excluded.
 - No watermarking or late-event handling
 - Results are collected to the driver node (not scalable for very large datasets)
 - Window functions like `lag()` and `row_number()` operate on bounded data after ingestion
+- Intermediate data is written to a temporary Parquet directory on disk during ingestion; this directory is automatically cleaned up after each run
 
 ## Prerequisites
 - Python 3.7+
@@ -79,7 +80,7 @@ spark-submit stream_processor.py <monitoring_dir> <provisioning_dir> <query_time
 ### Example
 
 ```bash
-spark-submit stream_processor.py monitoring_data/ provisioning_data/ '2021-04-14T08:09:52Z'
+spark-submit --driver-memory 4g stream_processor.py monitoring_data/ provisioning_data/ '2021-04-14T08:09:52Z'
 ```
 
 ### Alternative: run with `python` (if `spark-submit` is not on PATH)
