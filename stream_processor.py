@@ -21,7 +21,7 @@ PROVISIONING_SCHEMA = StructType([
     StructField("time", StringType(), True),
     StructField("service_id", StringType(), True),
     StructField("customer_id", StringType(), True),
-    StructField("segment", StringType(), True),
+    StructField("customer_segment", StringType(), True),
 ])
 
 
@@ -85,8 +85,10 @@ class TelecomStreamProcessor:
             .withColumn("time", to_timestamp(col("time"))) \
             .select("time", "service_id", "status")
 
+        # Normalize column name: production CSV uses "customer_segment", internal code uses "segment"
         provisioning_df = self.spark.read.parquet(provisioning_out) \
             .withColumn("time", to_timestamp(col("time"))) \
+            .withColumnRenamed("customer_segment", "segment") \
             .select("time", "service_id", "customer_id", "segment")
 
         return monitoring_df, provisioning_df, tmp_dir
@@ -245,8 +247,9 @@ class TelecomStreamProcessor:
                 col("dt.downtime_end").alias("downtime_end"),
                 col("dt.duration_seconds").alias("duration_seconds"),
                 col("prov.customer_id").alias("customer_id"),
-                col("prov.segment").alias("segment")
+                col("prov.segment").alias("segment"
             )
+        )
 
         # Filter for BUSINESS customers with active provisioning
         business_downtimes = prov_at_downtime \
