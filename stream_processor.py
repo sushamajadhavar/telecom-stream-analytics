@@ -5,6 +5,9 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import StructType, StructField, StringType
 import sys
+import tempfile
+import shutil
+import os
 
 
 # Explicit schemas are required for structured streaming (readStream cannot infer schema)
@@ -26,7 +29,8 @@ class TelecomStreamProcessor:
     def __init__(self):
         self.spark = SparkSession.builder \
             .appName("TelecomStreamAnalytics") \
-            .config("spark.sql.shuffle.partitions", "1") \
+            .config("spark.sql.shuffle.partitions", "8") \
+            .config("spark.driver.memory", "4g") \
             .master("local[*]") \
             .getOrCreate()
         self.spark.sparkContext.setLogLevel("WARN")
@@ -36,10 +40,18 @@ class TelecomStreamProcessor:
         Consume monitoring and provisioning CSV files from directories using
         Spark Structured Streaming (readStream).
 
-        Both streams are written to in-memory query tables via the 'memory' sink.
+        Both streams are written to temporary Parquet directories via the 'parquet' sink.
         trigger(once=True) processes all files currently in the directories and stops,
         making this suitable for batch-style CSV input while using the streaming API.
+        The temp directory path is returned so the caller can clean it up after use.
         """
+        tmp_dir = tempfile.mkdtemp(prefix="telecom_stream_")
+        os.chmod(tmp_dir, 0o700)
+        monitoring_out = os.path.join(tmp_dir, "monitoring_out")
+        provisioning_out = os.path.join(tmp_dir, "provisioning_out")
+        monitoring_ckpt = os.path.join(tmp_dir, "monitoring_ckpt")
+        provisioning_ckpt = os.path.join(tmp_dir, "provisioning_ckpt")
+
         monitoring_stream = self.spark.readStream \
             .schema(MONITORING_SCHEMA) \
             .option("header", "true") \
@@ -52,30 +64,32 @@ class TelecomStreamProcessor:
 
         monitoring_query = monitoring_stream \
             .writeStream \
-            .format("memory") \
-            .queryName("monitoring") \
+            .format("parquet") \
+            .option("path", monitoring_out) \
+            .option("checkpointLocation", monitoring_ckpt) \
             .trigger(once=True) \
             .start()
 
         provisioning_query = provisioning_stream \
             .writeStream \
-            .format("memory") \
-            .queryName("provisioning") \
+            .format("parquet") \
+            .option("path", provisioning_out) \
+            .option("checkpointLocation", provisioning_ckpt) \
             .trigger(once=True) \
             .start()
 
         monitoring_query.awaitTermination()
         provisioning_query.awaitTermination()
 
-        monitoring_df = self.spark.sql("SELECT * FROM monitoring") \
+        monitoring_df = self.spark.read.parquet(monitoring_out) \
             .withColumn("time", to_timestamp(col("time"))) \
             .select("time", "service_id", "status")
 
-        provisioning_df = self.spark.sql("SELECT * FROM provisioning") \
+        provisioning_df = self.spark.read.parquet(provisioning_out) \
             .withColumn("time", to_timestamp(col("time"))) \
             .select("time", "service_id", "customer_id", "segment")
 
-        return monitoring_df, provisioning_df
+        return monitoring_df, provisioning_df, tmp_dir
 
     def get_active_provisioning_at(self, provisioning_df, query_time):
         """
@@ -257,54 +271,60 @@ class TelecomStreamProcessor:
         # Consume data via Structured Streaming
         print(f"\nConsuming monitoring stream from: {monitoring_dir}")
         print(f"Consuming provisioning stream from: {provisioning_dir}")
-        monitoring_df, provisioning_df = self.ingest_streams(monitoring_dir, provisioning_dir)
-        monitoring_df.cache()
-        provisioning_df.cache()
-        print(f"Loaded {monitoring_df.count()} monitoring events")
-        print(f"Loaded {provisioning_df.count()} provisioning events")
+        monitoring_df, provisioning_df, tmp_dir = self.ingest_streams(monitoring_dir, provisioning_dir)
+        try:
+            monitoring_df.cache()
+            provisioning_df.cache()
+            print(f"Loaded {monitoring_df.count()} monitoring events")
+            print(f"Loaded {provisioning_df.count()} provisioning events")
 
-        query_time = query_time_str
-        print(f"\nQuery Time: {query_time}")
-        print("=" * 60)
+            query_time = query_time_str
+            print(f"\nQuery Time: {query_time}")
+            print("=" * 60)
 
-        # Task A: Customers in downtime
-        print("\n### TASK A: CUSTOMERS EXPERIENCING DOWNTIME ###")
-        customers_down = self.get_customers_in_downtime(
-            monitoring_df, provisioning_df, query_time
-        )
+            # Task A: Customers in downtime
+            print("\n### TASK A: CUSTOMERS EXPERIENCING DOWNTIME ###")
+            customers_down = self.get_customers_in_downtime(
+                monitoring_df, provisioning_df, query_time
+            )
 
-        customers_down_collected = customers_down.collect()
-        if not customers_down_collected:
-            print("\nNo customers experiencing downtime at this time.")
-        else:
-            print(f"\nCustomers in downtime: {len(customers_down_collected)}")
-            customers_down.show(truncate=False)
-
-        # Task B: Business downtime stats
-        print("\n### TASK B: BUSINESS CUSTOMER DOWNTIME STATISTICS ###")
-        business_downtimes, stats = self.get_business_downtime_stats(
-            monitoring_df, provisioning_df, query_time
-        )
-
-        stats_collected = stats.collect()
-        if stats_collected:
-            mean_duration = stats_collected[0]["mean_duration_seconds"]
-            max_duration = stats_collected[0]["max_duration_seconds"]
-
-            if mean_duration is not None:
-                print(f"\nMean downtime duration for BUSINESS customers: {mean_duration:.2f} seconds")
-                print(f"Max downtime duration for BUSINESS customers: {max_duration:.2f} seconds")
-                print(f"\nDowntime periods (BUSINESS customers):")
-                business_downtimes.select(
-                    "service_id", "customer_id", "downtime_start",
-                    "downtime_end", "duration_seconds"
-                ).show(truncate=False)
+            customers_down_collected = customers_down.collect()
+            if not customers_down_collected:
+                print("\nNo customers experiencing downtime at this time.")
             else:
-                print("\nNo business customer downtime data available.")
-        else:
-            print("No downtime data available.")
+                print(f"\nCustomers in downtime: {len(customers_down_collected)}")
+                customers_down.show(truncate=False)
 
-        print("\n" + "=" * 60)
+            # Task B: Business downtime stats
+            print("\n### TASK B: BUSINESS CUSTOMER DOWNTIME STATISTICS ###")
+            business_downtimes, stats = self.get_business_downtime_stats(
+                monitoring_df, provisioning_df, query_time
+            )
+
+            stats_collected = stats.collect()
+            if stats_collected:
+                mean_duration = stats_collected[0]["mean_duration_seconds"]
+                max_duration = stats_collected[0]["max_duration_seconds"]
+
+                if mean_duration is not None:
+                    print(f"\nMean downtime duration for BUSINESS customers: {mean_duration:.2f} seconds")
+                    print(f"Max downtime duration for BUSINESS customers: {max_duration:.2f} seconds")
+                    print(f"\nDowntime periods (BUSINESS customers):")
+                    business_downtimes.select(
+                        "service_id", "customer_id", "downtime_start",
+                        "downtime_end", "duration_seconds"
+                    ).show(truncate=False)
+                else:
+                    print("\nNo business customer downtime data available.")
+            else:
+                print("No downtime data available.")
+
+            print("\n" + "=" * 60)
+        finally:
+            try:
+                shutil.rmtree(tmp_dir)
+            except OSError as e:
+                print(f"Warning: failed to remove temp directory {tmp_dir}: {e}")
 
 
 def main():
